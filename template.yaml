@@ -1,3 +1,4 @@
+---
 AWSTemplateFormatVersion: "2010-09-09"
 Description: >
   Lab mock of the NHI network-impairment evidence-automation pipeline (pure
@@ -101,7 +102,7 @@ Resources:
   # The log bucket needs a fixed name: a bucket cannot reference its own
   # generated name in its properties (circular dependency). The name is built
   # from the stack name and account id, so keep the stack name lowercase and
-  # under 40 characters (S3 names are lowercase, max 63).
+  # 38 characters or fewer (S3 names are lowercase, max 63).
   AccessLogsBucket:
     Type: AWS::S3::Bucket
     Metadata:
