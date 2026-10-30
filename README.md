@@ -14,13 +14,23 @@ reports a degradation, the pipeline:
 
 ## ⚠️ Important Notice
 
-These tools are provided as sample code. If you intend to deploy them in
-production, start with a non-production environment first, and before deploying
-to production:
+This project is sample code for learning and evaluation. It is not production-ready
+as provided. Before you use any part of it in a production environment, deploy it
+in a non-production account first and test it thoroughly, then complete the
+following:
 
-- Test thoroughly in a non-production environment first
-- Review IAM permissions and security configurations against your organization's policies
-- Validate that behavior meets your operational requirements
+- Test every path end to end in the non-production account, including failure
+  cases (for example, throttling, missing permissions, and instances that fail to
+  respond), not only the happy path shown in the demo.
+- Review the IAM permissions, encryption, networking, and other security settings
+  against your organization's policies, and adjust them as needed.
+- Confirm that the pipeline's behavior meets your operational requirements, such
+  as escalation thresholds, evidence retention, and the cost of the resources it
+  creates.
+- Validate it against a workload that resembles production before you rely on it
+  for incident response.
+
+You are responsible for testing and validating this code in your own environment.
 
 See the LICENSE file for terms of use.
 
