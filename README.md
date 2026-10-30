@@ -34,6 +34,11 @@ You are responsible for testing and validating this code in your own environment
 
 See the LICENSE file for terms of use.
 
+## Architecture Diagram
+
+![NHI DevOps Agent Evidence Pipeline architecture](https://github.com/aws-samples/sample-nhi-devops-agent-evidence-pipeline/blob/main/Architecture.png?raw=true)
+
+
 ## Folder layout
 
 ```
