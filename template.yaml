@@ -1,0 +1,841 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Lab mock of the NHI network-impairment evidence-automation pipeline (pure
+  CloudFormation - no SAM transform). Provisions a CloudWatch alarm (NHI), SNS
+  fan-out, four Lambdas, an S3 evidence bucket, a DynamoDB state table (strict
+  sample cap + maintenance window), and a small SSM-managed Auto Scaling group so
+  lifecycle hooks and SSM Run Command run for real. DevOps Agent and Support API
+  calls are mocked by default.
+
+  Deploy with the aws CLI (no SAM required). The `package` step zips the local
+  src/ directory referenced by each function's `Code: src/` property, uploads it
+  to the artifact bucket, and rewrites `Code` to the S3 location:
+    aws cloudformation package  --template-file template.yaml \
+      --s3-bucket <your-artifact-bucket> --output-template-file packaged.yaml
+    aws cloudformation deploy   --template-file packaged.yaml \
+      --stack-name nhi-evidence-lab --capabilities CAPABILITY_IAM \
+      --parameter-overrides VpcId=... SubnetIds=...,... 
+  (scripts/deploy.sh wraps both steps.)
+
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC for the lab ASG instances.
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Two or more subnets (ideally in different AZs) for the ASG.
+  SampleCap:
+    Type: Number
+    Default: 3
+    Description: Max instances to collect evidence from per incident.
+  MockExternal:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: Mock DevOps Agent + Support API (true for lab accounts).
+  AgentSpaceId:
+    Type: String
+    Default: ""
+    Description: >
+      DevOps Agent Space id to file investigations under. Only used when
+      MockExternal=false. Leave empty for the mocked lab.
+  DevOpsAgentPollSeconds:
+    Type: Number
+    Default: 0
+    Description: >
+      Seconds the investigation Lambda waits (polling GetBacklogTask) for the
+      agent's async investigation before proceeding. 0 = fire-and-forget. Only
+      used when MockExternal=false.
+  InstanceType:
+    Type: String
+    Default: t3.micro
+  LatestAl2023Ami:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+
+Conditions:
+  HasAgentSpace: !Not [!Equals [!Ref AgentSpaceId, ""]]
+
+Resources:
+  # ---------------------------------------------------------------- Encryption
+  # One customer managed key for the SNS topics, the DynamoDB state table, and
+  # the Lambda environment variables. A CMK (rather than the AWS managed
+  # aws/sns key) is required because CloudWatch alarms can only publish to an
+  # encrypted topic if the key policy grants cloudwatch.amazonaws.com access.
+  # IAM principals in this account get access through their own IAM policies
+  # (root delegation below); each role grants itself only what it needs.
+  PipelineKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: NHI evidence pipeline - SNS, DynamoDB, and Lambda env encryption
+      EnableKeyRotation: true
+      PendingWindowInDays: 7
+      KeyPolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: EnableIamPolicies
+            Effect: Allow
+            Principal: { AWS: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:root" }
+            Action: "kms:*"
+            Resource: "*"
+          - Sid: AllowCloudWatchAlarmsToPublishToEncryptedSns
+            Effect: Allow
+            Principal: { Service: cloudwatch.amazonaws.com }
+            Action: ["kms:Decrypt", "kms:GenerateDataKey*"]
+            Resource: "*"
+
+  PipelineKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub "alias/${AWS::StackName}-pipeline"
+      TargetKeyId: !Ref PipelineKey
+
+  # ---------------------------------------------------------------- Storage
+  # Server access logs. The evidence bucket logs to AccessLogsBucket, and
+  # AccessLogsBucket logs to itself (under a separate prefix), so every bucket
+  # has access logging on and there is no third bucket to log. S3 allows the
+  # target bucket to be the source bucket. Log delivery only supports SSE-S3 on
+  # the target, and S3 writes as the logging service principal (granted in
+  # AccessLogsBucketPolicy).
+  #
+  # The log bucket needs a fixed name: a bucket cannot reference its own
+  # generated name in its properties (circular dependency). The name is built
+  # from the stack name and account id, so keep the stack name lowercase and
+  # under 40 characters (S3 names are lowercase, max 63).
+  AccessLogsBucket:
+    Type: AWS::S3::Bucket
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: >
+              The log bucket logs to itself, which needs a name known at
+              template time. The name includes the account id and stack name.
+    Properties:
+      BucketName: !Sub "${AWS::StackName}-access-logs-${AWS::AccountId}"
+      LoggingConfiguration:
+        DestinationBucketName: !Sub "${AWS::StackName}-access-logs-${AWS::AccountId}"
+        LogFilePrefix: access-logs/
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-access-logs
+            Status: Enabled
+            ExpirationInDays: 30
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 1
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+
+  AccessLogsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref AccessLogsBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowS3ServerAccessLogDelivery
+            Effect: Allow
+            Principal: { Service: logging.s3.amazonaws.com }
+            Action: s3:PutObject
+            Resource:
+              - !Sub "${AccessLogsBucket.Arn}/evidence-bucket/*"
+              - !Sub "${AccessLogsBucket.Arn}/access-logs/*"
+            Condition:
+              ArnLike:
+                "aws:SourceArn":
+                  - !GetAtt EvidenceBucket.Arn
+                  - !GetAtt AccessLogsBucket.Arn
+              StringEquals:
+                "aws:SourceAccount": !Ref AWS::AccountId
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource:
+              - !GetAtt AccessLogsBucket.Arn
+              - !Sub "${AccessLogsBucket.Arn}/*"
+            Condition:
+              Bool:
+                "aws:SecureTransport": false
+
+  EvidenceBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      LoggingConfiguration:
+        DestinationBucketName: !Ref AccessLogsBucket
+        LogFilePrefix: evidence-bucket/
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      # Versioning protects evidence from accidental overwrite/delete. Old
+      # versions expire so the lab bucket doesn't grow without bound.
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-noncurrent-versions
+            Status: Enabled
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 30
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+
+  # Evidence must only move over TLS. Lambda (boto3) and the AWS CLI already use
+  # HTTPS, so this only blocks plaintext requests.
+  EvidenceBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref EvidenceBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource:
+              - !GetAtt EvidenceBucket.Arn
+              - !Sub "${EvidenceBucket.Arn}/*"
+            Condition:
+              Bool:
+                "aws:SecureTransport": false
+
+  StateTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: pk, AttributeType: S }
+      KeySchema:
+        - { AttributeName: pk, KeyType: HASH }
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: !Ref PipelineKey
+
+  # ---------------------------------------------------------------- Messaging
+  NhiTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: nhi-pipeline-alarm
+      KmsMasterKeyId: !Ref PipelineKey
+
+  HookTargetTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: nhi-lifecycle-hook-target
+      KmsMasterKeyId: !Ref PipelineKey
+
+  # ----------------------------------------------- Role the ASG uses to notify
+  LifecycleHookRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: autoscaling.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: publish-to-hook-target
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: ["sns:Publish"]
+                Resource: !Ref HookTargetTopic
+              # The hook target topic is KMS-encrypted; publishers need the key.
+              - Effect: Allow
+                Action: ["kms:Decrypt", "kms:GenerateDataKey*"]
+                Resource: !GetAtt PipelineKey.Arn
+
+  # ============================================================================
+  # Lambda: Hook Installer (Branch 1 entry) - triggered by NHI alarm SNS
+  # ============================================================================
+  HookInstallerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: hook-installer
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - autoscaling:PutLifecycleHook
+                  - autoscaling:DeleteLifecycleHook
+                Resource: !Sub "arn:${AWS::Partition}:autoscaling:${AWS::Region}:${AWS::AccountId}:autoScalingGroup:*:autoScalingGroupName/${LabAsg}"
+              - Effect: Allow
+                Action: ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:DeleteItem"]
+                Resource: !GetAtt StateTable.Arn
+              # State table + Lambda env vars are encrypted with the pipeline CMK.
+              - Effect: Allow
+                Action: ["kms:Decrypt", "kms:Encrypt", "kms:GenerateDataKey*", "kms:DescribeKey"]
+                Resource: !GetAtt PipelineKey.Arn
+              # Lambda must be able to pass the ASG's notification role.
+              - Effect: Allow
+                Action: ["iam:PassRole"]
+                Resource: !GetAtt LifecycleHookRole.Arn
+
+  HookInstallerFn:
+    Type: AWS::Lambda::Function
+    Metadata:
+      checkov:
+        skip:
+          - id: CKV_AWS_117
+            comment: >
+              Calls only AWS APIs (S3, DynamoDB, SSM, Auto Scaling, CloudWatch,
+              Support, DevOps Agent) and needs no private resources. The lab VPC
+              has no NAT, so VPC attachment would need ~7 more interface endpoints.
+          - id: CKV_AWS_115
+            comment: >
+              Reserved concurrency is left to the account owner: new/lab accounts
+              often have a concurrency quota of 10, where any reservation fails
+              deployment. The per-incident sample cap is enforced in DynamoDB.
+      cfn_nag:
+        rules_to_suppress:
+          - id: W89
+            reason: >
+              Same as CKV_AWS_117: calls only public AWS APIs and needs no private
+              resources; the lab VPC has no NAT for a VPC-attached function.
+          - id: W92
+            reason: >
+              Same as CKV_AWS_115: lab accounts often have a concurrency quota of
+              10, where any reservation fails deployment.
+    Properties:
+      Runtime: python3.12
+      KmsKeyArn: !GetAtt PipelineKey.Arn
+      Handler: hook_installer.handler
+      Timeout: 120
+      MemorySize: 256
+      Role: !GetAtt HookInstallerRole.Arn
+      Code: src/
+      Environment:
+        Variables:
+          EVIDENCE_BUCKET: !Ref EvidenceBucket
+          STATE_TABLE: !Ref StateTable
+          SAMPLE_CAP: !Ref SampleCap
+          MOCK_EXTERNAL: !Ref MockExternal
+          LOG_LEVEL: INFO
+          ASG_NAME: !Ref LabAsg
+          HOOK_ROLE_ARN: !GetAtt LifecycleHookRole.Arn
+          HOOK_TARGET_SNS_ARN: !Ref HookTargetTopic
+
+  HookInstallerSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref NhiTopic
+      Protocol: lambda
+      Endpoint: !GetAtt HookInstallerFn.Arn
+
+  HookInstallerInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref HookInstallerFn
+      Action: lambda:InvokeFunction
+      Principal: sns.amazonaws.com
+      SourceArn: !Ref NhiTopic
+
+  # ============================================================================
+  # Lambda: Evidence Collector (Branch 1 target) - triggered by hook SNS
+  # ============================================================================
+  EvidenceCollectorRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W11
+            reason: >
+              ssm:GetCommandInvocation and cloudwatch:GetMetricStatistics do not
+              support resource-level permissions, so Resource must be "*". Both
+              are read-only. All other statements are scoped to specific ARNs.
+          - id: W76
+            reason: >
+              Complexity comes from splitting permissions into narrowly scoped
+              statements (one SSM document, ASG-tagged instances only, one ASG,
+              table, key and bucket). Merging them would broaden access.
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: evidence-collector
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: ["autoscaling:CompleteLifecycleAction"]
+                Resource: !Sub "arn:${AWS::Partition}:autoscaling:${AWS::Region}:${AWS::AccountId}:autoScalingGroup:*:autoScalingGroupName/${LabAsg}"
+              # SendCommand authorizes against both the document and the target
+              # instance: allow only the one diagnostic document, and only on
+              # instances that belong to the lab ASG.
+              - Effect: Allow
+                Action: ["ssm:SendCommand"]
+                Resource: !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}::document/AWS-RunShellScript"
+              - Effect: Allow
+                Action: ["ssm:SendCommand"]
+                Resource: !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*"
+                Condition:
+                  StringEquals:
+                    "ssm:resourceTag/aws:autoscaling:groupName": !Ref LabAsg
+              # Read-only; GetCommandInvocation has no resource-level permissions.
+              - Effect: Allow
+                Action: ["ssm:GetCommandInvocation"]
+                Resource: "*"
+              - Effect: Allow
+                Action: ["cloudwatch:GetMetricStatistics"]
+                Resource: "*"
+              - Effect: Allow
+                Action: ["dynamodb:UpdateItem", "dynamodb:GetItem"]
+                Resource: !GetAtt StateTable.Arn
+              - Effect: Allow
+                Action: ["kms:Decrypt", "kms:Encrypt", "kms:GenerateDataKey*", "kms:DescribeKey"]
+                Resource: !GetAtt PipelineKey.Arn
+              - Effect: Allow
+                Action: ["s3:PutObject"]
+                Resource: !Sub "${EvidenceBucket.Arn}/*"
+
+  EvidenceCollectorFn:
+    Type: AWS::Lambda::Function
+    Metadata:
+      checkov:
+        skip:
+          - id: CKV_AWS_117
+            comment: >
+              Calls only AWS APIs (S3, DynamoDB, SSM, Auto Scaling, CloudWatch,
+              Support, DevOps Agent) and needs no private resources. The lab VPC
+              has no NAT, so VPC attachment would need ~7 more interface endpoints.
+          - id: CKV_AWS_115
+            comment: >
+              Reserved concurrency is left to the account owner: new/lab accounts
+              often have a concurrency quota of 10, where any reservation fails
+              deployment. The per-incident sample cap is enforced in DynamoDB.
+      cfn_nag:
+        rules_to_suppress:
+          - id: W89
+            reason: >
+              Same as CKV_AWS_117: calls only public AWS APIs and needs no private
+              resources; the lab VPC has no NAT for a VPC-attached function.
+          - id: W92
+            reason: >
+              Same as CKV_AWS_115: lab accounts often have a concurrency quota of
+              10, where any reservation fails deployment.
+    Properties:
+      Runtime: python3.12
+      KmsKeyArn: !GetAtt PipelineKey.Arn
+      Handler: evidence_collector.handler
+      Timeout: 120
+      MemorySize: 256
+      Role: !GetAtt EvidenceCollectorRole.Arn
+      Code: src/
+      Environment:
+        Variables:
+          EVIDENCE_BUCKET: !Ref EvidenceBucket
+          STATE_TABLE: !Ref StateTable
+          SAMPLE_CAP: !Ref SampleCap
+          MOCK_EXTERNAL: !Ref MockExternal
+          LOG_LEVEL: INFO
+
+  EvidenceCollectorSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref HookTargetTopic
+      Protocol: lambda
+      Endpoint: !GetAtt EvidenceCollectorFn.Arn
+
+  EvidenceCollectorInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref EvidenceCollectorFn
+      Action: lambda:InvokeFunction
+      Principal: sns.amazonaws.com
+      SourceArn: !Ref HookTargetTopic
+
+  # ============================================================================
+  # Lambda: Impact Assessment (Branch 2, Step 4) - invoked by Investigation
+  # ============================================================================
+  ImpactAssessmentRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W11
+            reason: >
+              support:CreateCase, AddCommunicationToCase and AddAttachmentsToSet
+              do not support resource-level permissions, so Resource must be "*".
+              All other statements in this role are scoped to specific ARNs.
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: impact-assessment
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: ["s3:PutObject", "s3:GetObject", "s3:ListBucket"]
+                Resource:
+                  - !GetAtt EvidenceBucket.Arn
+                  - !Sub "${EvidenceBucket.Arn}/*"
+              - Effect: Allow
+                Action: ["dynamodb:GetItem"]
+                Resource: !GetAtt StateTable.Arn
+              - Effect: Allow
+                Action: ["kms:Decrypt", "kms:DescribeKey"]
+                Resource: !GetAtt PipelineKey.Arn
+              # AWS Support actions don't support resource-level permissions,
+              # so "*" is the only valid Resource (see W11 suppression above).
+              - Effect: Allow
+                Action: ["support:CreateCase", "support:AddCommunicationToCase", "support:AddAttachmentsToSet"]
+                Resource: "*"
+
+  ImpactAssessmentFn:
+    Type: AWS::Lambda::Function
+    Metadata:
+      checkov:
+        skip:
+          - id: CKV_AWS_117
+            comment: >
+              Calls only AWS APIs (S3, DynamoDB, SSM, Auto Scaling, CloudWatch,
+              Support, DevOps Agent) and needs no private resources. The lab VPC
+              has no NAT, so VPC attachment would need ~7 more interface endpoints.
+          - id: CKV_AWS_115
+            comment: >
+              Reserved concurrency is left to the account owner: new/lab accounts
+              often have a concurrency quota of 10, where any reservation fails
+              deployment. The per-incident sample cap is enforced in DynamoDB.
+      cfn_nag:
+        rules_to_suppress:
+          - id: W89
+            reason: >
+              Same as CKV_AWS_117: calls only public AWS APIs and needs no private
+              resources; the lab VPC has no NAT for a VPC-attached function.
+          - id: W92
+            reason: >
+              Same as CKV_AWS_115: lab accounts often have a concurrency quota of
+              10, where any reservation fails deployment.
+    Properties:
+      Runtime: python3.12
+      KmsKeyArn: !GetAtt PipelineKey.Arn
+      Handler: impact_assessment.handler
+      Timeout: 120
+      MemorySize: 256
+      Role: !GetAtt ImpactAssessmentRole.Arn
+      Code: src/
+      Environment:
+        Variables:
+          EVIDENCE_BUCKET: !Ref EvidenceBucket
+          STATE_TABLE: !Ref StateTable
+          SAMPLE_CAP: !Ref SampleCap
+          MOCK_EXTERNAL: !Ref MockExternal
+          LOG_LEVEL: INFO
+
+  # ============================================================================
+  # Lambda: Investigation (Branch 2 entry) - triggered by NHI alarm SNS
+  # ============================================================================
+  InvestigationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: investigation
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: ["s3:PutObject", "s3:ListBucket"]
+                Resource:
+                  - !GetAtt EvidenceBucket.Arn
+                  - !Sub "${EvidenceBucket.Arn}/*"
+              - Effect: Allow
+                Action: ["dynamodb:GetItem"]
+                Resource: !GetAtt StateTable.Arn
+              - Effect: Allow
+                Action: ["kms:Decrypt", "kms:DescribeKey"]
+                Resource: !GetAtt PipelineKey.Arn
+              - Effect: Allow
+                Action: ["lambda:InvokeFunction"]
+                Resource: !GetAtt ImpactAssessmentFn.Arn
+              # Real DevOps Agent integration (only exercised when MockExternal=false).
+              # The IAM namespace is 'aidevops' (not 'devops-agent'). Granted only
+              # when AgentSpaceId is set, and only on that one Agent Space.
+              - !If
+                - HasAgentSpace
+                - Effect: Allow
+                  Action:
+                    - aidevops:CreateBacklogTask
+                    - aidevops:GetBacklogTask
+                  Resource: !Sub "arn:${AWS::Partition}:aidevops:${AWS::Region}:${AWS::AccountId}:agentspace/${AgentSpaceId}"
+                - !Ref AWS::NoValue
+
+  InvestigationFn:
+    Type: AWS::Lambda::Function
+    Metadata:
+      checkov:
+        skip:
+          - id: CKV_AWS_117
+            comment: >
+              Calls only AWS APIs (S3, DynamoDB, SSM, Auto Scaling, CloudWatch,
+              Support, DevOps Agent) and needs no private resources. The lab VPC
+              has no NAT, so VPC attachment would need ~7 more interface endpoints.
+          - id: CKV_AWS_115
+            comment: >
+              Reserved concurrency is left to the account owner: new/lab accounts
+              often have a concurrency quota of 10, where any reservation fails
+              deployment. The per-incident sample cap is enforced in DynamoDB.
+      cfn_nag:
+        rules_to_suppress:
+          - id: W89
+            reason: >
+              Same as CKV_AWS_117: calls only public AWS APIs and needs no private
+              resources; the lab VPC has no NAT for a VPC-attached function.
+          - id: W92
+            reason: >
+              Same as CKV_AWS_115: lab accounts often have a concurrency quota of
+              10, where any reservation fails deployment.
+    Properties:
+      Runtime: python3.12
+      KmsKeyArn: !GetAtt PipelineKey.Arn
+      Handler: investigation.handler
+      Timeout: 120
+      MemorySize: 256
+      Role: !GetAtt InvestigationRole.Arn
+      Code: src/
+      Environment:
+        Variables:
+          EVIDENCE_BUCKET: !Ref EvidenceBucket
+          STATE_TABLE: !Ref StateTable
+          SAMPLE_CAP: !Ref SampleCap
+          MOCK_EXTERNAL: !Ref MockExternal
+          LOG_LEVEL: INFO
+          IMPACT_FUNCTION_NAME: !Ref ImpactAssessmentFn
+          AGENT_SPACE_ID: !Ref AgentSpaceId
+          DEVOPS_AGENT_POLL_SECONDS: !Ref DevOpsAgentPollSeconds
+
+  InvestigationSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref NhiTopic
+      Protocol: lambda
+      Endpoint: !GetAtt InvestigationFn.Arn
+
+  InvestigationInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref InvestigationFn
+      Action: lambda:InvokeFunction
+      Principal: sns.amazonaws.com
+      SourceArn: !Ref NhiTopic
+
+  # ---------------------------------------------------------------- Alarm (NHI)
+  # NOTE: value is 0 (healthy) / 100 (degraded). Alarm fires at >= 100.
+  NhiAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      # No explicit AlarmName: CloudFormation generates a stack-unique name, so
+      # replacement updates work and two lab stacks can coexist in one region.
+      # Scripts read the name from the NhiAlarmName output.
+      AlarmDescription: Fires when NFM HealthIndicator (NHI) indicates AWS network impairment.
+      Namespace: AWS/NetworkFlowMonitor
+      MetricName: HealthIndicator
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 100
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref NhiTopic]
+      OKActions: [!Ref NhiTopic]
+
+  # ---------------------------------------------------------------- Lab ASG
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ec2.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [!Ref InstanceRole]
+
+  InstanceSg:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Lab ASG instances - egress only (SSM needs no inbound).
+      VpcId: !Ref VpcId
+      # Instances only need HTTPS to the SSM endpoints (InstanceToSsmEndpointsEgress
+      # below). This match-nothing rule replaces the implicit allow-all egress.
+      # DNS (VPC resolver), IMDS and NTP use link-local addresses that SGs don't
+      # filter, so they keep working.
+      SecurityGroupEgress:
+        - Description: Placeholder - removes default allow-all egress
+          IpProtocol: icmp
+          FromPort: 252
+          ToPort: 252
+          CidrIp: 255.255.255.255/32
+
+  # Standalone rule: VpcEndpointSg already references InstanceSg, so an inline
+  # rule here would create a circular dependency.
+  InstanceToSsmEndpointsEgress:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !GetAtt InstanceSg.GroupId
+      Description: HTTPS from lab instances to SSM VPC endpoints only
+      IpProtocol: tcp
+      FromPort: 443
+      ToPort: 443
+      DestinationSecurityGroupId: !GetAtt VpcEndpointSg.GroupId
+
+  # ------------------------------------------------- SSM via VPC endpoints
+  # The lab VPC has no NAT/IGW, so the SSM agent reaches the SSM service over
+  # three interface endpoints. This keeps instances private (no public IP, no
+  # internet route) while still allowing SSM Run Command. Nothing inbound from
+  # the internet: the endpoint SG only accepts HTTPS from the instance SG.
+  VpcEndpointSg:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: SSM interface endpoints - allow HTTPS from lab instances only.
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - Description: HTTPS from lab instances to SSM endpoints
+          IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          SourceSecurityGroupId: !GetAtt InstanceSg.GroupId
+      # Interface endpoints never initiate connections, and SG return traffic
+      # is stateful, so no outbound is needed. Replace the implicit allow-all
+      # egress with a match-nothing rule (ICMP to the limited-broadcast address,
+      # which is never routed), which makes the SG deny-all outbound.
+      SecurityGroupEgress:
+        - Description: Disallow all outbound - endpoints only answer inbound requests
+          IpProtocol: icmp
+          FromPort: 252
+          ToPort: 252
+          CidrIp: 255.255.255.255/32
+
+  SsmEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.ssm"
+      VpcId: !Ref VpcId
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds: !Ref SubnetIds
+      SecurityGroupIds: [!GetAtt VpcEndpointSg.GroupId]
+
+  SsmMessagesEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.ssmmessages"
+      VpcId: !Ref VpcId
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds: !Ref SubnetIds
+      SecurityGroupIds: [!GetAtt VpcEndpointSg.GroupId]
+
+  Ec2MessagesEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.ec2messages"
+      VpcId: !Ref VpcId
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds: !Ref SubnetIds
+      SecurityGroupIds: [!GetAtt VpcEndpointSg.GroupId]
+
+  LaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateData:
+        ImageId: !Ref LatestAl2023Ami
+        InstanceType: !Ref InstanceType
+        IamInstanceProfile: { Arn: !GetAtt InstanceProfile.Arn }
+        SecurityGroupIds: [!GetAtt InstanceSg.GroupId]
+        # Enforce IMDSv2 (session tokens). The SSM agent on AL2023 supports it.
+        MetadataOptions:
+          HttpEndpoint: enabled
+          HttpTokens: required
+          HttpPutResponseHopLimit: 1
+
+  LabAsg:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      MinSize: "0"
+      MaxSize: "6"
+      DesiredCapacity: "3"
+      VPCZoneIdentifier: !Ref SubnetIds
+      LaunchTemplate:
+        LaunchTemplateId: !Ref LaunchTemplate
+        Version: !GetAtt LaunchTemplate.LatestVersionNumber
+      Tags:
+        - { Key: Name, Value: nhi-lab-instance, PropagateAtLaunch: true }
+
+Outputs:
+  EvidenceBucketName:
+    Value: !Ref EvidenceBucket
+  AccessLogsBucketName:
+    Value: !Ref AccessLogsBucket
+  StateTableName:
+    Value: !Ref StateTable
+  NhiAlarmName:
+    Value: !Ref NhiAlarm
+  AsgName:
+    Value: !Ref LabAsg
+  NhiTopicArn:
+    Value: !Ref NhiTopic
