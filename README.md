@@ -323,6 +323,20 @@ optional DevOps Agent poll) are bounded polls with no AWS waiter equivalent and
 carry `# nosemgrep: arbitrary-sleep`. The SSM poll in the evidence collector
 uses boto3's `command_executed` waiter.
 
+Step 5: Maintenance Window Integration (Optional) 
+
+For workloads that undergo planned maintenance (such as scheduled deployments, load testing, or infrastructure changes), the pipeline includes an optional maintenance window capability. When a maintenance window is active, the pipeline suppresses both the evidence collection and Support escalation paths, preventing false alarms during expected disruptions. 
+
+[Figure7: Storing maintenance window in Amazon DynamoDB] 
+
+The maintenance window state is stored in Amazon DynamoDB with a TTL attribute, so windows automatically expire even if the operator forgets to close them manually. (This reuses the same DynamoDB table that backs the collect-and-release sample cap.) The evidence collection Lambda checks the maintenance window state before installing the lifecycle hook, and the impact assessment Lambda checks it before creating a Support case and AWS DevOps Agent trigger. 
+
+[Figure8: Example entry in Amazon DynamoDB] 
+
+Extending with Third-Party Integrations 
+
+The pipeline's SNS-based architecture makes it straightforward to extend with third-party integrations. You can add SNS subscriptions that trigger Lambda functions to create incidents in PagerDuty, tickets in ServiceNow, or issues in Jira. Each integration receives the same NHI event context and can reference the S3 evidence package, ensuring consistent information across all incident management systems. 
+
 ---
 
 ## Prove the sample cap holds
