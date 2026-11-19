@@ -1,9 +1,6 @@
 # NHI + DevOps Agent Evidence Pipeline
 
-This sample is a deployable, end-to-end pipeline that collects evidence of AWS
-network impairments and escalates them to AWS Support. It monitors the **Network
-Health Indicator (NHI)** from Amazon CloudWatch Network Flow Monitor. When NHI
-reports a degradation, the pipeline:
+This sample walks through an end-to-end pipeline that helps you capture AWS network diagnostics and share them with AWS Support. By monitoring the Network Health Indicator (NHI) from Amazon CloudWatch Network Flow Monitor, the pipeline:
 
 1. Captures short-lived, per-host network diagnostics from Auto Scaling instances
    before they terminate.
